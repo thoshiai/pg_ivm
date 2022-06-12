@@ -12,10 +12,14 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/multixact.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/pg_depend.h"
+#include "catalog/heap.h"
 #include "catalog/pg_trigger.h"
+#include "commands/cluster.h"
+#include "commands/matview.h"
 #include "commands/tablecmds.h"
 #include "executor/execdesc.h"
 #include "executor/executor.h"
@@ -27,6 +31,7 @@
 #include "parser/parse_clause.h"
 #include "parser/parse_func.h"
 #include "parser/parse_relation.h"
+#include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rowsecurity.h"
 #include "storage/lmgr.h"
@@ -141,28 +146,12 @@ PG_FUNCTION_INFO_V1(IVM_immediate_before);
 PG_FUNCTION_INFO_V1(IVM_immediate_maintenance);
 
 /*
- * ExecRefreshMatView -- execute a REFRESH MATERIALIZED VIEW command
+ * ExecRefreshImmv -- execute a refresh_immv() function
  *
- * This refreshes the materialized view by creating a new table and swapping
- * the relfilenodes of the new table and the old materialized view, so the OID
- * of the original materialized view is preserved. Thus we do not lose GRANT
- * nor references to this materialized view.
- *
- * If WITH NO DATA was specified, this is effectively like a TRUNCATE;
- * otherwise it is like a TRUNCATE followed by an INSERT using the SELECT
- * statement associated with the materialized view.  The statement node's
- * skipData field shows whether the clause was used.
- *
- * Indexes are rebuilt too, via REINDEX. Since we are effectively bulk-loading
- * the new heap, it's better to create the indexes afterwards than to fill them
- * incrementally while we load.
- *
- * The matview's "populated" state is changed based on whether the contents
- * reflect the result set of the materialized view's query.
+ * This imitates PostgreSQL's ExecRefreshMatView().
  */
 ObjectAddress
-ExecRefreshImmv(const char *relname, bool skipData, const char *queryString,
-				   QueryCompletion *qc)
+ExecRefreshImmv(const char *relname, bool skipData, QueryCompletion *qc)
 {
 	Oid			matviewOid;
 	Relation	matviewRel;
@@ -173,7 +162,7 @@ ExecRefreshImmv(const char *relname, bool skipData, const char *queryString,
 	Oid			OIDNewHeap;
 	DestReceiver *dest;
 	uint64		processed = 0;
-	bool		concurrent;
+	//bool		concurrent;
 	LOCKMODE	lockmode;
 	char		relpersistence;
 	Oid			save_userid;
@@ -191,23 +180,18 @@ ExecRefreshImmv(const char *relname, bool skipData, const char *queryString,
 
 	/* Determine strength of lock needed. */
 	//concurrent = stmt->concurrent;
-	concurrent = false;
 	//lockmode = concurrent ? ExclusiveLock : AccessExclusiveLock;
 	lockmode = AccessExclusiveLock;
 
 	/*
 	 * Get a lock until end of transaction.
 	 */
-	//matviewOid = RangeVarGetRelidExtended(stmt->relation,
-	//									  lockmode, 0,
-	//									  RangeVarCallbackOwnsTable, NULL);
 	matviewOid = RelnameGetRelid(relname);
 	if (!OidIsValid(matviewOid))
 	    ereport(ERROR,
 		    (errcode(ERRCODE_UNDEFINED_TABLE),
 		     errmsg("relation \"%s\" does not exist", relname)));
 
-	//matviewRel = table_open(matviewOid, NoLock);
 	matviewRel = table_open(matviewOid, lockmode);
 	relowner = matviewRel->rd_rel->relowner;
 
@@ -237,34 +221,24 @@ ExecRefreshImmv(const char *relname, bool skipData, const char *queryString,
 		elog(ERROR, "could not find tuple for immvrelid %s", relname);
 	}
 
-	datum = heap_getattr(tup, Anum_pg_ivm_immv_skipdata, tupdesc, &isnull);
+	datum = heap_getattr(tup, Anum_pg_ivm_immv_withnodata, tupdesc, &isnull);
 	Assert(!isnull);
 	oldSkipData = (bool)(DatumGetBool(datum));
 
-
+	/* update pg_ivm_immv view */
 	if (skipData != oldSkipData)
 	{
 		Datum values[Natts_pg_ivm_immv];
 		bool nulls[Natts_pg_ivm_immv];
 		bool replaces[Natts_pg_ivm_immv];
 		HeapTuple newtup = NULL;
-		Datum datum2;
-		bool isnull2;
 
 		memset(values, 0, sizeof(values));
-		//datum2 = heap_getattr(tup, Anum_pg_ivm_immv_viewdef, tupdesc, &isnull2);
-		//Assert(!isnull2);
-		//query = (Query *) stringToNode(TextDatumGetCString(datum));
-
-		//values[Anum_pg_ivm_immv_immvrelid -1 ] = ObjectIdGetDatum(matviewOid);
-		values[Anum_pg_ivm_immv_skipdata -1 ] = BoolGetDatum(skipData);
-		//values[Anum_pg_ivm_immv_viewdef -1 ] = datum;
-
+		values[Anum_pg_ivm_immv_withnodata -1 ] = BoolGetDatum(skipData);
 		MemSet(nulls, false, sizeof(nulls));
 		MemSet(replaces, false, sizeof(replaces));
-		replaces[Anum_pg_ivm_immv_immvrelid -1 ] = false;
-		replaces[Anum_pg_ivm_immv_skipdata -1 ] = true;
-		replaces[Anum_pg_ivm_immv_viewdef -1 ] = false;
+		replaces[Anum_pg_ivm_immv_withnodata -1 ] = true;
+
 		newtup = heap_modify_tuple(tup, tupdesc, values, nulls, replaces);
 
    		CatalogTupleUpdate(pgIvmImmv, &newtup->t_self, newtup);
@@ -372,11 +346,7 @@ ExecRefreshImmv(const char *relname, bool skipData, const char *queryString,
 
 	/* Generate the data, if wanted. */
 	if (!skipData)
-	{
-		//processed = refresh_matview_datafill(dest, dataQuery, NULL, NULL, queryString);
-		//processed = refresh_immv_datafill(dest, query, queryEnv, tupdesc_old, "");
 		processed = refresh_immv_datafill(dest, dataQuery, NULL, NULL, "");
-	}
 
 	/* Make the matview match the newly generated data. */
 	refresh_by_heap_swap(matviewOid, OIDNewHeap, relpersistence);
@@ -393,8 +363,7 @@ ExecRefreshImmv(const char *relname, bool skipData, const char *queryString,
 
 	if (!skipData && oldSkipData)
 	{
-		//CreateIndexOnIMMV(viewQuery, matviewRel, false);
-		CreateIvmTriggersOnBaseTables(viewQuery, matviewOid, true);		//CreateChangePreventTrigger(matviewOid);
+		CreateIvmTriggersOnBaseTables(viewQuery, matviewOid, true);
 	}
 
 	table_close(matviewRel, NoLock);
@@ -493,7 +462,6 @@ refresh_immv_datafill(DestReceiver *dest, Query *query,
 
 	return processed;
 }
-
 
 /*
  * Swap the physical files of the target and transient tables, then rebuild

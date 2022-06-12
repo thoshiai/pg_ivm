@@ -233,12 +233,10 @@ refresh_immv(PG_FUNCTION_ARGS)
 {
 	text	*t_relname = PG_GETARG_TEXT_PP(0);
 	bool	skipData = PG_GETARG_BOOL(1);
-
 	char	*relname = text_to_cstring(t_relname);
 	QueryCompletion qc;
-	char	*sql;
 
-	ExecRefreshImmv( relname, skipData, sql, &qc);
+	ExecRefreshImmv( relname, skipData, &qc);
 
 	PG_RETURN_INT64(qc.nprocessed);
 }

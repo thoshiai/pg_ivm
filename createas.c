@@ -962,7 +962,7 @@ get_primary_key_attnos_from_query(Query *query, List **constraintList, bool is_c
  * Store the query for the IMMV to pg_ivwm_immv
  */
 static void
-StoreImmvQuery(Oid viewOid, bool skipData, Query *viewQuery)
+StoreImmvQuery(Oid viewOid, bool withNoData, Query *viewQuery)
 {
 	char   *querytree = nodeToString((Node *) viewQuery);
 	Datum values[Natts_pg_ivm_immv];
@@ -976,7 +976,7 @@ StoreImmvQuery(Oid viewOid, bool skipData, Query *viewQuery)
 	memset(isNulls, false, sizeof(isNulls));
 
 	values[Anum_pg_ivm_immv_immvrelid -1 ] = ObjectIdGetDatum(viewOid);
-	values[Anum_pg_ivm_immv_skipdata -1 ] = BoolGetDatum(skipData);
+	values[Anum_pg_ivm_immv_withnodata -1 ] = BoolGetDatum(withNoData);
 	values[Anum_pg_ivm_immv_viewdef -1 ] = CStringGetTextDatum(querytree);
 
 	pgIvmImmv = table_open(PgIvmImmvRelationId(), RowExclusiveLock);

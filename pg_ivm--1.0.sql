@@ -4,7 +4,7 @@ CREATE SCHEMA __pg_ivm__;
 
 CREATE TABLE __pg_ivm__.pg_ivm_immv(
   immvrelid regclass NOT NULL,
-  skipData bool NOT NULL,
+  withnodata bool NOT NULL,
   viewdef text NOT NULL,
 
   CONSTRAINT pg_ivm_immv_pkey PRIMARY KEY (immvrelid)
