@@ -41,6 +41,9 @@ extern Query *rewriteQueryForIMMV(Query *query, List *colNames);
 
 /* matview.c */
 
+extern ObjectAddress ExecRefreshImmv(const char *relname, bool skipData,
+										const char *queryString,
+										QueryCompletion *qc);
 extern bool ImmvIncrementalMaintenanceIsEnabled(void);
 extern Datum IVM_immediate_before(PG_FUNCTION_ARGS);
 extern Datum IVM_immediate_maintenance(PG_FUNCTION_ARGS);

@@ -161,8 +161,8 @@ PG_FUNCTION_INFO_V1(IVM_immediate_maintenance);
  * reflect the result set of the materialized view's query.
  */
 ObjectAddress
-ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
-				   ParamListInfo params, QueryCompletion *qc)
+ExecRefreshImmv(const char *relname, bool skipData, const char *queryString,
+				   QueryCompletion *qc)
 {
 	Oid			matviewOid;
 	Relation	matviewRel;
@@ -184,16 +184,24 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 
 	/* Determine strength of lock needed. */
 	//concurrent = stmt->concurrent;
+	concurrent = false;
 	//lockmode = concurrent ? ExclusiveLock : AccessExclusiveLock;
 	lockmode = AccessExclusiveLock;
 
 	/*
 	 * Get a lock until end of transaction.
 	 */
-	matviewOid = RangeVarGetRelidExtended(stmt->relation,
-										  lockmode, 0,
-										  RangeVarCallbackOwnsTable, NULL);
-	matviewRel = table_open(matviewOid, NoLock);
+	//matviewOid = RangeVarGetRelidExtended(stmt->relation,
+	//									  lockmode, 0,
+	//									  RangeVarCallbackOwnsTable, NULL);
+	matviewOid = RelnameGetRelid(relname);
+	if (!OidIsValid(matviewOid))
+	    ereport(ERROR,
+		    (errcode(ERRCODE_UNDEFINED_TABLE),
+		     errmsg("relation \"%s\" does not exist", relname)));
+
+	//matviewRel = table_open(matviewOid, NoLock);
+	matviewRel = table_open(matviewOid, lockmode);
 	relowner = matviewRel->rd_rel->relowner;
 
 	/*
@@ -205,33 +213,37 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 	SetUserIdAndSecContext(relowner,
 						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
 	save_nestlevel = NewGUCNestLevel();
-	oldPopulated = RelationIsPopulated(matviewRel);
+	//oldPopulated = RelationIsPopulated(matviewRel);
+	oldPopulated = true;
 
 	/* Make sure it is a materialized view. */
+/*
 	if (matviewRel->rd_rel->relkind != RELKIND_MATVIEW)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("\"%s\" is not a materialized view",
 						RelationGetRelationName(matviewRel))));
-
+*/
 	/* Check that CONCURRENTLY is not specified if not populated. */
+/*
 	if (concurrent && !RelationIsPopulated(matviewRel))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("CONCURRENTLY cannot be used when the materialized view is not populated")));
-
+*/
 	/* Check that conflicting options have not been specified. */
-	if (concurrent && stmt->skipData)
+/*
+	if (concurrent && skipData)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("%s and %s options cannot be used together",
 						"CONCURRENTLY", "WITH NO DATA")));
-
+*/
 
 	viewQuery = get_immv_query(matviewRel);
 
 	/* For IMMV, we need to rewrite matview query */
-	if (!stmt->skipData)
+	if (!skipData)
 		dataQuery = rewriteQueryForIMMV(viewQuery,NIL);
 	else
 		dataQuery = viewQuery;
@@ -277,13 +289,13 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 	 * NB: We count on this to protect us against problems with refreshing the
 	 * data using TABLE_INSERT_FROZEN.
 	 */
-	CheckTableNotInUse(matviewRel, "REFRESH MATERIALIZED VIEW");
+	CheckTableNotInUse(matviewRel, "refresh an IMMV");
 
 	/*
 	 * Tentatively mark the matview as populated or not (this will roll back
 	 * if we fail later).
 	 */
-	SetMatViewPopulatedState(matviewRel, !stmt->skipData);
+	//SetMatViewPopulatedState(matviewRel, !skipData);
 
 	/* Concurrent refresh builds new data in temp tablespace, and does diff. */
 //	if (concurrent)
@@ -298,7 +310,7 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 //	}
 
 	/* delete IMMV triggers. */
-	if (stmt->skipData )
+	if (skipData)
 	{
 		Relation	tgRel;
 		Relation	depRel;
@@ -371,16 +383,17 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 	 * will be gone).
 	 */
 	OIDNewHeap = make_new_heap(matviewOid, tableSpace,
-							   matviewRel->rd_rel->relam,
 							   relpersistence, ExclusiveLock);
 	LockRelationOid(OIDNewHeap, AccessExclusiveLock);
 	dest = CreateTransientRelDestReceiver(OIDNewHeap);
 
 	/* Generate the data, if wanted. */
-	if (!stmt->skipData)
+	if (!skipData)
+	{
 		//processed = refresh_matview_datafill(dest, dataQuery, NULL, NULL, queryString);
 		//processed = refresh_immv_datafill(dest, query, queryEnv, tupdesc_old, "");
 		processed = refresh_immv_datafill(dest, dataQuery, NULL, NULL, "");
+	}
 
 	/* Make the matview match the newly generated data. */
 //	if (concurrent)
@@ -398,11 +411,11 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 		 * inserts and deletes it issues get counted by lower-level code.)
 		 */
 		pgstat_count_truncate(matviewRel);
-		if (!stmt->skipData)
+		if (!skipData)
 			pgstat_count_heap_insert(matviewRel, processed);
 //	}
 
-	if (!stmt->skipData && !oldPopulated)
+	if (!skipData && !oldPopulated)
 	{
 		CreateIndexOnIMMV(viewQuery, matviewRel, false);
 		CreateIvmTriggersOnBaseTables(dataQuery, matviewOid, false);
@@ -427,12 +440,10 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 	 * completion tag output might break applications using it.
 	 */
 	if (qc)
-		SetQueryCompletion(qc, CMDTAG_REFRESH_MATERIALIZED_VIEW, processed);
+		SetQueryCompletion(qc, CMDTAG_SELECT, processed);
 
 	return address;
 }
-
-////////////////////////////////////////////////////////////
 
 
 /*
