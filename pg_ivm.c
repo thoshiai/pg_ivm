@@ -44,6 +44,7 @@ static void parseNameAndColumns(const char *string, List **names, List **colName
 
 /* SQL callable functions */
 PG_FUNCTION_INFO_V1(create_immv);
+PG_FUNCTION_INFO_V1(refresh_immv);
 PG_FUNCTION_INFO_V1(IVM_prevent_immv_change);
 
 /*
@@ -155,6 +156,7 @@ create_immv(PG_FUNCTION_ARGS)
 {
 	text	*t_relname = PG_GETARG_TEXT_PP(0);
 	text	*t_sql = PG_GETARG_TEXT_PP(1);
+
 	char	*relname = text_to_cstring(t_relname);
 	char	*sql = text_to_cstring(t_sql);
 	List	*parsetree_list;
@@ -223,6 +225,70 @@ IVM_prevent_immv_change(PG_FUNCTION_ARGS)
 	return PointerGetDatum(NULL);
 }
 
+/*
+ * User inerface for refreshing an IMMV
+ */
+Datum
+refresh_immv(PG_FUNCTION_ARGS)
+{
+	text	*t_relname = PG_GETARG_TEXT_PP(0);
+	bool	check = PG_GETARG_BOOL(1);
+
+	char	*relname = text_to_cstring(t_relname);
+	//char	*sql = text_to_cstring(t_sql);
+	List	*parsetree_list;
+	RawStmt	*parsetree;
+	Query	*query;
+	QueryCompletion qc;
+	List	*names = NIL;
+	List	*colNames = NIL;
+/*
+	ParseState *pstate = make_parsestate(NULL);
+	CreateTableAsStmt *ctas;
+	StringInfoData command_buf;
+
+	parseNameAndColumns(relname, &names, &colNames);
+
+	initStringInfo(&command_buf);
+	appendStringInfo(&command_buf, "SELECT create_immv('%s' AS '%s');", relname, sql);
+	appendStringInfo(&command_buf, "%s;", sql);
+	pstate->p_sourcetext = command_buf.data;
+
+	parsetree_list = pg_parse_query(sql);
+
+	// XXX: should we check t_sql before command_buf?
+	if (list_length(parsetree_list) != 1)
+		elog(ERROR, "invalid view definition");
+
+	parsetree = linitial_node(RawStmt, parsetree_list);
+
+	ctas = makeNode(CreateTableAsStmt);
+	ctas->query = parsetree->stmt;
+	ctas->objtype = OBJECT_MATVIEW;
+	ctas->is_select_into = false;
+	ctas->into = makeNode(IntoClause);
+	ctas->into->rel = makeRangeVarFromNameList(names);
+	ctas->into->colNames = colNames;
+	ctas->into->accessMethod = NULL;
+	ctas->into->options = NIL;
+	ctas->into->onCommit = ONCOMMIT_NOOP;
+	ctas->into->tableSpaceName = NULL;
+	ctas->into->viewQuery = parsetree->stmt;
+	ctas->into->skipData = false;
+
+	query = transformStmt(pstate, (Node *)ctas);
+	Assert(query->commandType == CMD_UTILITY && IsA(query->utilityStmt, CreateTableAsStmt));
+
+	ExecCreateImmv(pstate, (CreateTableAsStmt *)query->utilityStmt, NULL, NULL, &qc);
+*/
+
+
+	//PG_RETURN_INT64(qc.nprocessed);
+	PG_RETURN_INT64(1);
+}
+
+
+//////////////////
 
 /*
  * Create triggers to prevent IMMV from being changed
@@ -241,7 +307,7 @@ CreateChangePreventTrigger(Oid matviewOid)
 	refaddr.classId = RelationRelationId;
 	refaddr.objectId = matviewOid;
 	refaddr.objectSubId = 0;
-
+ 
 
 	ivm_trigger = makeNode(CreateTrigStmt);
 	ivm_trigger->relation = NULL;

@@ -23,6 +23,12 @@ STRICT
 AS 'MODULE_PATHNAME', 'create_immv'
 LANGUAGE C;
 
+CREATE FUNCTION refresh_immv(text, bool)
+RETURNS bigint 
+STRICT
+AS 'MODULE_PATHNAME', 'refresh_immv'
+LANGUAGE C;
+
 -- trigger functions
 
 CREATE FUNCTION "IVM_immediate_before"()

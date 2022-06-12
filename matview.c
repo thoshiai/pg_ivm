@@ -14,6 +14,8 @@
 #include "access/genam.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_trigger.h"
 #include "commands/tablecmds.h"
 #include "executor/execdesc.h"
 #include "executor/executor.h"
@@ -91,6 +93,7 @@ static uint64 refresh_immv_datafill(DestReceiver *dest, Query *query,
 						 TupleDesc *resultTupleDesc,
 						 const char *queryString);
 
+static void refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence);
 static void OpenImmvIncrementalMaintenance(void);
 static void CloseImmvIncrementalMaintenance(void);
 static Query *get_immv_query(Relation matviewRel);
@@ -136,6 +139,301 @@ static List *get_securityQuals(Oid relId, int rt_index, Query *query);
 /* SQL callable functions */
 PG_FUNCTION_INFO_V1(IVM_immediate_before);
 PG_FUNCTION_INFO_V1(IVM_immediate_maintenance);
+
+/*
+ * ExecRefreshMatView -- execute a REFRESH MATERIALIZED VIEW command
+ *
+ * This refreshes the materialized view by creating a new table and swapping
+ * the relfilenodes of the new table and the old materialized view, so the OID
+ * of the original materialized view is preserved. Thus we do not lose GRANT
+ * nor references to this materialized view.
+ *
+ * If WITH NO DATA was specified, this is effectively like a TRUNCATE;
+ * otherwise it is like a TRUNCATE followed by an INSERT using the SELECT
+ * statement associated with the materialized view.  The statement node's
+ * skipData field shows whether the clause was used.
+ *
+ * Indexes are rebuilt too, via REINDEX. Since we are effectively bulk-loading
+ * the new heap, it's better to create the indexes afterwards than to fill them
+ * incrementally while we load.
+ *
+ * The matview's "populated" state is changed based on whether the contents
+ * reflect the result set of the materialized view's query.
+ */
+ObjectAddress
+ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
+				   ParamListInfo params, QueryCompletion *qc)
+{
+	Oid			matviewOid;
+	Relation	matviewRel;
+	Query	   *dataQuery;
+	Query	   *viewQuery;
+	Oid			tableSpace;
+	Oid			relowner;
+	Oid			OIDNewHeap;
+	DestReceiver *dest;
+	uint64		processed = 0;
+	bool		concurrent;
+	LOCKMODE	lockmode;
+	char		relpersistence;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
+	ObjectAddress address;
+	bool oldPopulated;
+
+	/* Determine strength of lock needed. */
+	//concurrent = stmt->concurrent;
+	//lockmode = concurrent ? ExclusiveLock : AccessExclusiveLock;
+	lockmode = AccessExclusiveLock;
+
+	/*
+	 * Get a lock until end of transaction.
+	 */
+	matviewOid = RangeVarGetRelidExtended(stmt->relation,
+										  lockmode, 0,
+										  RangeVarCallbackOwnsTable, NULL);
+	matviewRel = table_open(matviewOid, NoLock);
+	relowner = matviewRel->rd_rel->relowner;
+
+	/*
+	 * Switch to the owner's userid, so that any functions are run as that
+	 * user.  Also lock down security-restricted operations and arrange to
+	 * make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+	oldPopulated = RelationIsPopulated(matviewRel);
+
+	/* Make sure it is a materialized view. */
+	if (matviewRel->rd_rel->relkind != RELKIND_MATVIEW)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("\"%s\" is not a materialized view",
+						RelationGetRelationName(matviewRel))));
+
+	/* Check that CONCURRENTLY is not specified if not populated. */
+	if (concurrent && !RelationIsPopulated(matviewRel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CONCURRENTLY cannot be used when the materialized view is not populated")));
+
+	/* Check that conflicting options have not been specified. */
+	if (concurrent && stmt->skipData)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("%s and %s options cannot be used together",
+						"CONCURRENTLY", "WITH NO DATA")));
+
+
+	viewQuery = get_immv_query(matviewRel);
+
+	/* For IMMV, we need to rewrite matview query */
+	if (!stmt->skipData)
+		dataQuery = rewriteQueryForIMMV(viewQuery,NIL);
+	else
+		dataQuery = viewQuery;
+
+	/*
+	 * Check that there is a unique index with no WHERE clause on one or more
+	 * columns of the materialized view if CONCURRENTLY is specified.
+	 */
+/*
+	if (concurrent)
+	{
+		List	   *indexoidlist = RelationGetIndexList(matviewRel);
+		ListCell   *indexoidscan;
+		bool		hasUniqueIndex = false;
+
+		foreach(indexoidscan, indexoidlist)
+		{
+			Oid			indexoid = lfirst_oid(indexoidscan);
+			Relation	indexRel;
+
+			indexRel = index_open(indexoid, AccessShareLock);
+			hasUniqueIndex = is_usable_unique_index(indexRel);
+			index_close(indexRel, AccessShareLock);
+			if (hasUniqueIndex)
+				break;
+		}
+
+		list_free(indexoidlist);
+
+		if (!hasUniqueIndex)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot refresh materialized view \"%s\" concurrently",
+							quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
+													   RelationGetRelationName(matviewRel))),
+					 errhint("Create a unique index with no WHERE clause on one or more columns of the materialized view.")));
+	}
+*/
+	/*
+	 * Check for active uses of the relation in the current transaction, such
+	 * as open scans.
+	 *
+	 * NB: We count on this to protect us against problems with refreshing the
+	 * data using TABLE_INSERT_FROZEN.
+	 */
+	CheckTableNotInUse(matviewRel, "REFRESH MATERIALIZED VIEW");
+
+	/*
+	 * Tentatively mark the matview as populated or not (this will roll back
+	 * if we fail later).
+	 */
+	SetMatViewPopulatedState(matviewRel, !stmt->skipData);
+
+	/* Concurrent refresh builds new data in temp tablespace, and does diff. */
+//	if (concurrent)
+//	{
+//		tableSpace = GetDefaultTablespace(RELPERSISTENCE_TEMP, false);
+//		relpersistence = RELPERSISTENCE_TEMP;
+//	}
+//	else
+//	{
+		tableSpace = matviewRel->rd_rel->reltablespace;
+		relpersistence = matviewRel->rd_rel->relpersistence;
+//	}
+
+	/* delete IMMV triggers. */
+	if (stmt->skipData )
+	{
+		Relation	tgRel;
+		Relation	depRel;
+		ScanKeyData key;
+		SysScanDesc scan;
+		HeapTuple	tup;
+		ObjectAddresses *immv_triggers;
+
+		immv_triggers = new_object_addresses();
+
+		tgRel = table_open(TriggerRelationId, RowExclusiveLock);
+		depRel = table_open(DependRelationId, RowExclusiveLock);
+
+		/* search triggers that depends on IMMV. */
+		ScanKeyInit(&key,
+					Anum_pg_depend_refobjid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(matviewOid));
+		scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+								  NULL, 1, &key);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			ObjectAddress obj;
+			Form_pg_depend foundDep = (Form_pg_depend) GETSTRUCT(tup);
+
+			if (foundDep->classid == TriggerRelationId)
+			{
+				HeapTuple	tgtup;
+				ScanKeyData tgkey[1];
+				SysScanDesc tgscan;
+				Form_pg_trigger tgform;
+
+				/* Find the trigger name. */
+				ScanKeyInit(&tgkey[0],
+							Anum_pg_trigger_oid,
+							BTEqualStrategyNumber, F_OIDEQ,
+							ObjectIdGetDatum(foundDep->objid));
+
+				tgscan = systable_beginscan(tgRel, TriggerOidIndexId, true,
+											NULL, 1, tgkey);
+				tgtup = systable_getnext(tgscan);
+				if (!HeapTupleIsValid(tgtup))
+					elog(ERROR, "could not find tuple for immv trigger %u", foundDep->objid);
+
+				tgform = (Form_pg_trigger) GETSTRUCT(tgtup);
+
+				/* If trigger is created by IMMV, delete it. */
+				if (strncmp(NameStr(tgform->tgname), "IVM_trigger_", 12) == 0)
+				{
+					obj.classId = foundDep->classid;
+					obj.objectId = foundDep->objid;
+					obj.objectSubId = foundDep->refobjsubid;
+					add_exact_object_address(&obj, immv_triggers);
+				}
+				systable_endscan(tgscan);
+			}
+		}
+		systable_endscan(scan);
+
+		performMultipleDeletions(immv_triggers, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
+
+		table_close(depRel, RowExclusiveLock);
+		table_close(tgRel, RowExclusiveLock);
+		free_object_addresses(immv_triggers);
+	}
+
+	/*
+	 * Create the transient table that will receive the regenerated data. Lock
+	 * it against access by any other process until commit (by which time it
+	 * will be gone).
+	 */
+	OIDNewHeap = make_new_heap(matviewOid, tableSpace,
+							   matviewRel->rd_rel->relam,
+							   relpersistence, ExclusiveLock);
+	LockRelationOid(OIDNewHeap, AccessExclusiveLock);
+	dest = CreateTransientRelDestReceiver(OIDNewHeap);
+
+	/* Generate the data, if wanted. */
+	if (!stmt->skipData)
+		//processed = refresh_matview_datafill(dest, dataQuery, NULL, NULL, queryString);
+		//processed = refresh_immv_datafill(dest, query, queryEnv, tupdesc_old, "");
+		processed = refresh_immv_datafill(dest, dataQuery, NULL, NULL, "");
+
+	/* Make the matview match the newly generated data. */
+//	if (concurrent)
+//	{
+//		//int			old_depth = matview_maintenance_depth;
+//	}
+//	else
+//	{
+		refresh_by_heap_swap(matviewOid, OIDNewHeap, relpersistence);
+
+		/*
+		 * Inform cumulative stats system about our activity: basically, we
+		 * truncated the matview and inserted some new data.  (The concurrent
+		 * code path above doesn't need to worry about this because the
+		 * inserts and deletes it issues get counted by lower-level code.)
+		 */
+		pgstat_count_truncate(matviewRel);
+		if (!stmt->skipData)
+			pgstat_count_heap_insert(matviewRel, processed);
+//	}
+
+	if (!stmt->skipData && !oldPopulated)
+	{
+		CreateIndexOnIMMV(viewQuery, matviewRel, false);
+		CreateIvmTriggersOnBaseTables(dataQuery, matviewOid, false);
+	}
+
+	table_close(matviewRel, NoLock);
+
+	/* Roll back any GUC changes */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
+
+	ObjectAddressSet(address, RelationRelationId, matviewOid);
+
+	/*
+	 * Save the rowcount so that pg_stat_statements can track the total number
+	 * of rows processed by REFRESH MATERIALIZED VIEW command. Note that we
+	 * still don't display the rowcount in the command completion tag output,
+	 * i.e., the display_rowcount flag of CMDTAG_REFRESH_MATERIALIZED_VIEW
+	 * command tag is left false in cmdtaglist.h. Otherwise, the change of
+	 * completion tag output might break applications using it.
+	 */
+	if (qc)
+		SetQueryCompletion(qc, CMDTAG_REFRESH_MATERIALIZED_VIEW, processed);
+
+	return address;
+}
+
+////////////////////////////////////////////////////////////
+
 
 /*
  * refresh_immv_datafill
@@ -209,6 +507,18 @@ refresh_immv_datafill(DestReceiver *dest, Query *query,
 	return processed;
 }
 
+
+/*
+ * Swap the physical files of the target and transient tables, then rebuild
+ * the target's indexes and throw away the transient table.  Security context
+ * swapping is handled by the called function, so it is not needed here.
+ */
+static void
+refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence)
+{
+	finish_heap_swap(matviewOid, OIDNewHeap, false, false, true, true,
+					 RecentXmin, ReadNextMultiXactId(), relpersistence);
+}
 
 /*
  * This should be used to test whether the backend is in a context where it is
