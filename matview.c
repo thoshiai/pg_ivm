@@ -180,7 +180,14 @@ ExecRefreshImmv(const char *relname, bool skipData, const char *queryString,
 	int			save_sec_context;
 	int			save_nestlevel;
 	ObjectAddress address;
-	bool oldPopulated;
+	Relation pgIvmImmv;
+	TupleDesc tupdesc;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool isnull;
+	Datum datum;
+	bool oldSkipData;
 
 	/* Determine strength of lock needed. */
 	//concurrent = stmt->concurrent;
@@ -213,75 +220,66 @@ ExecRefreshImmv(const char *relname, bool skipData, const char *queryString,
 	SetUserIdAndSecContext(relowner,
 						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
 	save_nestlevel = NewGUCNestLevel();
-	//oldPopulated = RelationIsPopulated(matviewRel);
-	oldPopulated = true;
 
-	/* Make sure it is a materialized view. */
-/*
-	if (matviewRel->rd_rel->relkind != RELKIND_MATVIEW)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("\"%s\" is not a materialized view",
-						RelationGetRelationName(matviewRel))));
-*/
-	/* Check that CONCURRENTLY is not specified if not populated. */
-/*
-	if (concurrent && !RelationIsPopulated(matviewRel))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("CONCURRENTLY cannot be used when the materialized view is not populated")));
-*/
-	/* Check that conflicting options have not been specified. */
-/*
-	if (concurrent && skipData)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("%s and %s options cannot be used together",
-						"CONCURRENTLY", "WITH NO DATA")));
-*/
+	pgIvmImmv = table_open(PgIvmImmvRelationId(), RowExclusiveLock);
+	tupdesc = RelationGetDescr(pgIvmImmv);
+	ScanKeyInit(&key,
+			    Anum_pg_ivm_immv_immvrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationGetRelid(matviewRel)));
+	scan = systable_beginscan(pgIvmImmv, PgIvmImmvPrimaryKeyIndexId(),
+								  true, NULL, 1, &key);
+
+	tup = systable_getnext(scan);
+
+	if (!HeapTupleIsValid(tup))
+	{
+		elog(ERROR, "could not find tuple for immvrelid %s", relname);
+	}
+
+	datum = heap_getattr(tup, Anum_pg_ivm_immv_skipdata, tupdesc, &isnull);
+	Assert(!isnull);
+	oldSkipData = (bool)(DatumGetBool(datum));
+
+
+	if (skipData != oldSkipData)
+	{
+		Datum values[Natts_pg_ivm_immv];
+		bool nulls[Natts_pg_ivm_immv];
+		bool replaces[Natts_pg_ivm_immv];
+		HeapTuple newtup = NULL;
+		Datum datum2;
+		bool isnull2;
+
+		memset(values, 0, sizeof(values));
+		//datum2 = heap_getattr(tup, Anum_pg_ivm_immv_viewdef, tupdesc, &isnull2);
+		//Assert(!isnull2);
+		//query = (Query *) stringToNode(TextDatumGetCString(datum));
+
+		//values[Anum_pg_ivm_immv_immvrelid -1 ] = ObjectIdGetDatum(matviewOid);
+		values[Anum_pg_ivm_immv_skipdata -1 ] = BoolGetDatum(skipData);
+		//values[Anum_pg_ivm_immv_viewdef -1 ] = datum;
+
+		MemSet(nulls, false, sizeof(nulls));
+		MemSet(replaces, false, sizeof(replaces));
+		replaces[Anum_pg_ivm_immv_immvrelid -1 ] = false;
+		replaces[Anum_pg_ivm_immv_skipdata -1 ] = true;
+		replaces[Anum_pg_ivm_immv_viewdef -1 ] = false;
+		newtup = heap_modify_tuple(tup, tupdesc, values, nulls, replaces);
+
+   		CatalogTupleUpdate(pgIvmImmv, &newtup->t_self, newtup);
+		heap_freetuple(newtup);
+	}
+
+	systable_endscan(scan);
+	table_close(pgIvmImmv, NoLock);
 
 	viewQuery = get_immv_query(matviewRel);
 
 	/* For IMMV, we need to rewrite matview query */
 	if (!skipData)
 		dataQuery = rewriteQueryForIMMV(viewQuery,NIL);
-	else
-		dataQuery = viewQuery;
 
-	/*
-	 * Check that there is a unique index with no WHERE clause on one or more
-	 * columns of the materialized view if CONCURRENTLY is specified.
-	 */
-/*
-	if (concurrent)
-	{
-		List	   *indexoidlist = RelationGetIndexList(matviewRel);
-		ListCell   *indexoidscan;
-		bool		hasUniqueIndex = false;
-
-		foreach(indexoidscan, indexoidlist)
-		{
-			Oid			indexoid = lfirst_oid(indexoidscan);
-			Relation	indexRel;
-
-			indexRel = index_open(indexoid, AccessShareLock);
-			hasUniqueIndex = is_usable_unique_index(indexRel);
-			index_close(indexRel, AccessShareLock);
-			if (hasUniqueIndex)
-				break;
-		}
-
-		list_free(indexoidlist);
-
-		if (!hasUniqueIndex)
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("cannot refresh materialized view \"%s\" concurrently",
-							quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
-													   RelationGetRelationName(matviewRel))),
-					 errhint("Create a unique index with no WHERE clause on one or more columns of the materialized view.")));
-	}
-*/
 	/*
 	 * Check for active uses of the relation in the current transaction, such
 	 * as open scans.
@@ -291,23 +289,8 @@ ExecRefreshImmv(const char *relname, bool skipData, const char *queryString,
 	 */
 	CheckTableNotInUse(matviewRel, "refresh an IMMV");
 
-	/*
-	 * Tentatively mark the matview as populated or not (this will roll back
-	 * if we fail later).
-	 */
-	//SetMatViewPopulatedState(matviewRel, !skipData);
-
-	/* Concurrent refresh builds new data in temp tablespace, and does diff. */
-//	if (concurrent)
-//	{
-//		tableSpace = GetDefaultTablespace(RELPERSISTENCE_TEMP, false);
-//		relpersistence = RELPERSISTENCE_TEMP;
-//	}
-//	else
-//	{
-		tableSpace = matviewRel->rd_rel->reltablespace;
-		relpersistence = matviewRel->rd_rel->relpersistence;
-//	}
+	tableSpace = matviewRel->rd_rel->reltablespace;
+	relpersistence = matviewRel->rd_rel->relpersistence;
 
 	/* delete IMMV triggers. */
 	if (skipData)
@@ -396,29 +379,22 @@ ExecRefreshImmv(const char *relname, bool skipData, const char *queryString,
 	}
 
 	/* Make the matview match the newly generated data. */
-//	if (concurrent)
-//	{
-//		//int			old_depth = matview_maintenance_depth;
-//	}
-//	else
-//	{
-		refresh_by_heap_swap(matviewOid, OIDNewHeap, relpersistence);
+	refresh_by_heap_swap(matviewOid, OIDNewHeap, relpersistence);
 
-		/*
-		 * Inform cumulative stats system about our activity: basically, we
-		 * truncated the matview and inserted some new data.  (The concurrent
-		 * code path above doesn't need to worry about this because the
-		 * inserts and deletes it issues get counted by lower-level code.)
-		 */
-		pgstat_count_truncate(matviewRel);
-		if (!skipData)
-			pgstat_count_heap_insert(matviewRel, processed);
-//	}
+	/*
+	 * Inform cumulative stats system about our activity: basically, we
+	 * truncated the matview and inserted some new data.  (The concurrent
+	 * code path above doesn't need to worry about this because the
+	 * inserts and deletes it issues get counted by lower-level code.)
+	 */
+	pgstat_count_truncate(matviewRel);
+	if (!skipData)
+		pgstat_count_heap_insert(matviewRel, processed);
 
-	if (!skipData && !oldPopulated)
+	if (!skipData && oldSkipData)
 	{
-		CreateIndexOnIMMV(viewQuery, matviewRel, false);
-		CreateIvmTriggersOnBaseTables(dataQuery, matviewOid, false);
+		//CreateIndexOnIMMV(viewQuery, matviewRel, false);
+		CreateIvmTriggersOnBaseTables(viewQuery, matviewOid, true);		//CreateChangePreventTrigger(matviewOid);
 	}
 
 	table_close(matviewRel, NoLock);
